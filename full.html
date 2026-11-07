@@ -880,6 +880,7 @@ function freshState() {
     daily: {},
     alarms: [],
     settings: { sound: true, voice: true, notify: true, autoNext: false },
+    guard: { asked: false, enabled: false, leaveSec: 2, voidPunish: false, shot: false, hits: 0, shots: 0, lastAway: 0 },
     timer: { end: null, total: 0, remain: 0 }
   };
 }
@@ -2715,6 +2716,377 @@ function init() {
 
 document.addEventListener('DOMContentLoaded', init);
 if (document.readyState !== 'loading') init();
+
+/* ================= 分心守望 ================= */
+(function () {
+  'use strict';
+  const DEF = { asked: false, enabled: false, leaveSec: 2, voidPunish: false, shot: false, hits: 0, shots: 0, lastAway: 0 };
+  const $ = sel => document.querySelector(sel);
+  function cfg() {
+    if (!S.guard) S.guard = {};
+    for (const k in DEF) if (S.guard[k] === undefined) S.guard[k] = DEF[k];
+    return S.guard;
+  }
+  let awayAt = 0, ringTimer = null, titleTimer = null, baseTitle = document.title;
+  let stream = null, video = null, canvas = null, suppressUntil = 0, lastNotify = 0;
+
+  /* ---------- 样式 ---------- */
+  const CSS = `
+  #jrgWatchAuth,#jrgWatchPunish{position:fixed;inset:0;z-index:99;display:none;align-items:center;justify-content:center;background:rgba(6,4,3,.88);backdrop-filter:blur(7px);padding:20px}
+  #jrgWatchAuth.show,#jrgWatchPunish.show{display:flex}
+  .jw-card{width:min(580px,94vw);max-height:90vh;overflow:auto;border:1px solid rgba(201,162,39,.5);border-radius:14px;background:linear-gradient(180deg,#2b1a17,#160f0d);box-shadow:0 26px 74px rgba(0,0,0,.82),inset 0 1px 0 rgba(255,255,255,.05);padding:24px 26px;color:#efe3cd;font-family:inherit;line-height:1.75}
+  .jw-seal{width:44px;height:44px;margin:0 auto 10px;border:2px solid #b5323a;border-radius:4px;color:#e2606a;display:grid;place-items:center;font-size:17px;transform:rotate(-6deg);box-shadow:inset 0 0 16px rgba(194,43,48,.3)}
+  .jw-title{margin:0 0 10px;text-align:center;font-size:20px;letter-spacing:.32em;color:#ffe8ae;font-weight:600}
+  .jw-title.red{color:#ffb3ae}
+  .jw-p{margin:0 0 12px;font-size:13.5px;color:#d8c9b1}
+  .jw-list{margin:0 0 14px;padding-left:18px;font-size:12.5px;color:#c3b39a}
+  .jw-list li{margin-bottom:7px}
+  .jw-list b{color:#ecd48a;font-weight:600}
+  .jw-check{display:flex;gap:9px;align-items:flex-start;font-size:13px;margin:10px 0;cursor:pointer;color:#e9dcc6}
+  .jw-check input{margin-top:4px;accent-color:#c9a227;width:15px;height:15px;flex:0 0 auto}
+  .jw-row{display:flex;align-items:center;gap:8px;font-size:12.5px;color:#a9977f;margin:12px 0}
+  .jw-row input{width:74px;padding:6px 8px}
+  .jw-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:16px}
+  .jw-tip{font-size:11.5px;color:#8d7c66;line-height:1.7;margin:14px 0 0;border-left:2px solid rgba(140,20,23,.7);padding-left:10px}
+  .jw-quote{background:rgba(140,20,23,.18);border:1px solid rgba(194,43,48,.55);border-radius:9px;padding:12px 14px;font-size:14px;color:#ffd9d4;margin:14px 0;line-height:1.85}
+  .jw-shot{display:block;width:100%;max-height:250px;object-fit:cover;border-radius:8px;border:1px solid rgba(201,162,39,.32);margin:12px 0;filter:saturate(.85)}
+  .jw-big{font-size:30px;color:#ff8f88;letter-spacing:.08em;font-variant-numeric:tabular-nums}
+  `;
+  const st = document.createElement('style');
+  st.id = 'jrgWatchStyle'; st.textContent = CSS;
+  document.head.appendChild(st);
+
+  /* ---------- 授权卡 ---------- */
+  function buildAuth() {
+    if ($('#jrgWatchAuth')) return;
+    const el = document.createElement('div');
+    el.id = 'jrgWatchAuth';
+    el.innerHTML = `
+      <div class="jw-card">
+        <div class="jw-seal">允</div>
+        <h3 class="jw-title">守 望 允 准</h3>
+        <p class="jw-p">燃香之后，本宫要盯着你。开始之前，请先允准以下权限：</p>
+        <ul class="jw-list">
+          <li><b>离开监视</b>：记录你切走页面、切到别的窗口的次数与时长。浏览器无权得知你具体打开了哪个软件，也不会上传任何内容。</li>
+          <li><b>响铃与通知</b>：离开超过阈值立即响铃，并向系统推送「速回景仁宫」；你回到本页后执行鞭笞。</li>
+          <li><b>截屏留证（可选）</b>：开启后浏览器会弹出共享屏幕授权，只在命中分心时于本机截一张图作罪证，绝不上传。</li>
+        </ul>
+        <label class="jw-check"><input type="checkbox" id="jwAgree"> 我已知晓并允许上述监视</label>
+        <label class="jw-check"><input type="checkbox" id="jwShot"> 允许截屏留证（会弹出浏览器共享屏幕授权）</label>
+        <div class="jw-row"><span>离开判定阈值</span><input type="number" id="jwSec" min="1" max="60" value="2"><span>秒</span></div>
+        <div class="jw-actions">
+          <button class="btn gold" id="jwAllow" disabled>允准并燃香</button>
+          <button class="btn ghost" id="jwDeny">暂不监视</button>
+        </div>
+        <p class="jw-tip">桌面版可真正识别抖音 / 快手 / 哔哩哔哩等前台程序，并把鞭笞窗口强制置顶到所有软件之上；网页版受浏览器沙箱限制，只能判断你是否离开了本页。</p>
+      </div>`;
+    document.body.appendChild(el);
+
+    const agree = el.querySelector('#jwAgree');
+    const allow = el.querySelector('#jwAllow');
+    agree.addEventListener('change', () => { allow.disabled = !agree.checked; });
+
+    allow.addEventListener('click', async () => {
+      const c = cfg();
+      c.asked = true; c.enabled = true;
+      c.leaveSec = Math.max(1, Math.min(60, parseInt(el.querySelector('#jwSec').value, 10) || 2));
+      save();
+      if (window.Notification && Notification.permission === 'default') {
+        try { const pr = Notification.requestPermission(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {}
+      }
+      if (el.querySelector('#jwShot').checked) await askScreen();
+      closeAuth();
+      toast('已允准守望：离开超过 ' + c.leaveSec + ' 秒即响铃鞭笞');
+      startFocus();
+    });
+
+    el.querySelector('#jwDeny').addEventListener('click', () => {
+      const c = cfg();
+      c.asked = true; c.enabled = false;
+      save();
+      closeAuth();
+      toast('已跳过监视，本次不设守望');
+      startFocus();
+    });
+  }
+  function openAuth() {
+    buildAuth();
+    const c = cfg();
+    const sec = $('#jwSec');
+    if (sec) sec.value = c.leaveSec;
+    $('#jrgWatchAuth').classList.add('show');
+  }
+  function closeAuth() { const el = $('#jrgWatchAuth'); if (el) el.classList.remove('show'); }
+
+  /* ---------- 截屏留证 ---------- */
+  async function askScreen() {
+    const c = cfg();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      toast('此浏览器不支持截屏留证'); c.shot = false; save(); return false;
+    }
+    try {
+      suppressUntil = Date.now() + 20000;
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 2 }, audio: false });
+      video = document.createElement('video');
+      video.muted = true; video.playsInline = true; video.srcObject = stream;
+      video.style.cssText = 'position:fixed;left:-9px;top:-9px;width:1px;height:1px;opacity:0;pointer-events:none';
+      document.body.appendChild(video);
+      try { await video.play(); } catch (e) {}
+      const track = stream.getVideoTracks()[0];
+      if (track) track.addEventListener('ended', () => {
+        c.shot = false; save(); toast('屏幕共享已停止，截屏留证关闭');
+      });
+      c.shot = true; save();
+      return true;
+    } catch (e) {
+      c.shot = false; save();
+      toast('未获得屏幕共享授权，已跳过留证');
+      return false;
+    }
+  }
+  function grabShot() {
+    try {
+      if (!cfg().shot || !video || !video.videoWidth) return '';
+      canvas = canvas || document.createElement('canvas');
+      const w = Math.min(720, video.videoWidth);
+      const h = Math.round(video.videoHeight * w / video.videoWidth);
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(video, 0, 0, w, h);
+      cfg().shots = (cfg().shots || 0) + 1; save();
+      return canvas.toDataURL('image/jpeg', 0.62);
+    } catch (e) { return ''; }
+  }
+
+  /* ---------- 响铃与通知 ---------- */
+  function playBeats() {
+    try {
+      tone(1568, 0.16, 'square', 0.34, 0);
+      tone(2093, 0.16, 'square', 0.24, 0.18);
+      tone(1046, 0.22, 'triangle', 0.3, 0.36);
+    } catch (e) {}
+  }
+  function startRing() {
+    if (ringTimer) return;
+    playBeats();
+    ringTimer = setInterval(playBeats, 1200);
+    try { if (navigator.vibrate) navigator.vibrate([300, 120, 300, 120, 300]); } catch (e) {}
+    baseTitle = document.title;
+    let on = false;
+    titleTimer = setInterval(() => {
+      on = !on;
+      document.title = on ? '⚠ 速回景仁宫 · 分心受罚' : baseTitle;
+    }, 900);
+  }
+  function stopRing() {
+    if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
+    if (titleTimer) { clearInterval(titleTimer); titleTimer = null; }
+    document.title = baseTitle;
+  }
+  function notifyAway() {
+    if (Date.now() - lastNotify < 8000) return;
+    lastNotify = Date.now();
+    try {
+      if (window.Notification && Notification.permission === 'granted') {
+        const n = new Notification('景仁宫 · 你离开了', {
+          body: '自律未毕，速回景仁宫领罚。',
+          tag: 'jrg-watch', requireInteraction: true
+        });
+        n.onclick = () => { try { window.focus(); } catch (e) {} n.close(); };
+      }
+    } catch (e) {}
+  }
+
+  /* ---------- 鞭笞界面 ---------- */
+  function buildPunish() {
+    if ($('#jrgWatchPunish')) return;
+    const el = document.createElement('div');
+    el.id = 'jrgWatchPunish';
+    el.innerHTML = `
+      <div class="jw-card">
+        <div class="jw-seal">罚</div>
+        <h3 class="jw-title red">分 心 记 过</h3>
+        <p class="jw-p" style="text-align:center;margin-bottom:4px">擅离职守</p>
+        <p class="jw-big" style="text-align:center" id="jwSecTxt">0</p>
+        <p class="jw-p" style="text-align:center;color:#a9977f;font-size:12px">秒</p>
+        <img class="jw-shot" id="jwShotImg" alt="分心留证" hidden>
+        <div class="jw-quote" id="jwQuote"></div>
+        <div class="jw-actions"><button class="btn gold" id="jwAccept">领罚，续燃此香</button></div>
+        <div class="jw-actions" id="jwVoidWrap" hidden><button class="btn danger" id="jwVoid">此香作废，从头再燃</button></div>
+        <p class="jw-tip">守望仍开着。下一鞭，不会再提醒。</p>
+      </div>`;
+    document.body.appendChild(el);
+    el.querySelector('#jwAccept').addEventListener('click', () => el.classList.remove('show'));
+    el.querySelector('#jwVoid').addEventListener('click', () => {
+      el.classList.remove('show');
+      voidFocus();
+    });
+  }
+  function showPunish(sec, line, shot) {
+    buildPunish();
+    $('#jwSecTxt').textContent = sec;
+    $('#jwQuote').textContent = line;
+    const img = $('#jwShotImg');
+    if (shot) { img.src = shot; img.hidden = false; } else { img.hidden = true; img.removeAttribute('src'); }
+    $('#jwVoidWrap').hidden = !cfg().voidPunish;
+    $('#jrgWatchPunish').classList.add('show');
+  }
+
+  /* ---------- 判罚 ---------- */
+  function punish(sec, reason) {
+    const c = cfg();
+    c.hits = (c.hits || 0) + 1;
+    c.lastAway = sec;
+    addLog('watch', '分心受罚 · ' + (reason || '离开页面') + ' ' + sec + ' 秒（累计 ' + c.hits + ' 次）');
+    save();
+    const route = S.route || 'male';
+    const line = '擅离职守 ' + sec + ' 秒！这一鞭，替你的自律打的——' +
+      (route === 'female' ? '再敢分心，仔细你的皮！' : '再有下次，定不轻饶！');
+    const shot = grabShot();
+    try { playWhip(line); } catch (e) {}
+    try { speak(line, route === 'female' ? 'ladyOld' : 'elder'); } catch (e) {}
+    showPunish(sec, line, shot);
+  }
+  function voidFocus() {
+    if (S.phase !== 'focus') return;
+    const used = Math.round((S.timer.total - Math.max(0, S.timer.end - Date.now())) / 60000);
+    const d = todayStat();
+    d.fail++;
+    addLog('fail', '分心作废：已燃 ' + used + ' 分，不计功次');
+    S.phase = 'idle';
+    S.timer.end = null;
+    S.timer.total = 0;
+    try { hideOverseer(); } catch (e) {}
+    try { overseerPlan = []; } catch (e) {}
+    save();
+    renderAll();
+    toast('此炷香已废。分心即废，从头再燃。');
+  }
+
+  /* ---------- 离开检测 ---------- */
+  function onLeave() {
+    if (!cfg().enabled || S.phase !== 'focus' || awayAt) return;
+    if (Date.now() < suppressUntil) return;
+    awayAt = Date.now();
+    startRing();
+    notifyAway();
+  }
+  function onReturn() {
+    if (!awayAt) return;
+    const away = Date.now() - awayAt;
+    awayAt = 0;
+    stopRing();
+    if (S.phase !== 'focus') return;
+    if (Date.now() < suppressUntil) return;
+    const sec = Math.round(away / 100) / 10;
+    if (sec >= cfg().leaveSec) punish(sec, '离开页面');
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) onLeave(); else onReturn();
+  });
+  window.addEventListener('blur', () => onLeave());
+  window.addEventListener('focus', () => onReturn());
+  window.addEventListener('pagehide', () => onLeave());
+  window.addEventListener('pageshow', () => onReturn());
+
+  /* ---------- 开始前拦截，先取得授权 ---------- */
+  document.addEventListener('click', e => {
+    const btn = e.target && e.target.closest ? e.target.closest('#btnStart') : null;
+    if (!btn) return;
+    if (cfg().asked) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    openAuth();
+  }, true);
+
+  /* ---------- 设置面板 ---------- */
+  function injectSettings() {
+    const box = document.querySelector('#paneData .settings');
+    if (!box || document.getElementById('settingWatch')) return;
+    const anchor = box.querySelector('.actions');
+    const html = document.createElement('div');
+    html.innerHTML = `
+      <div class="set-row"><span>分心守望（离开即响铃鞭笞）</span><input type="checkbox" id="settingWatch"></div>
+      <div class="set-row"><span>离开判定阈值（秒）</span><input type="number" id="watchLeave" min="1" max="60"></div>
+      <div class="set-row"><span>截屏留证（需屏幕共享）</span><input type="checkbox" id="settingShot"></div>`;
+    const nodes = Array.from(html.children);
+    nodes.forEach(n => box.insertBefore(n, anchor));
+
+    const cw = box.querySelector('#settingWatch');
+    const cl = box.querySelector('#watchLeave');
+    const cs = box.querySelector('#settingShot');
+    cw.checked = !!cfg().enabled;
+    cl.value = cfg().leaveSec;
+    cs.checked = !!cfg().shot;
+
+    cw.addEventListener('change', () => {
+      const c = cfg();
+      c.asked = true;
+      c.enabled = cw.checked;
+      save();
+      toast(c.enabled ? '守望已开启' : '守望已关闭');
+    });
+    cl.addEventListener('change', () => {
+      const c = cfg();
+      c.leaveSec = Math.max(1, Math.min(60, parseInt(cl.value, 10) || 2));
+      cl.value = c.leaveSec;
+      save();
+    });
+    cs.addEventListener('change', async () => {
+      if (cs.checked) {
+        const okk = await askScreen();
+        cs.checked = okk;
+      } else {
+        try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+        stream = null; video = null;
+        cfg().shot = false; save();
+      }
+    });
+  }
+
+  /* ---------- 开发者面板 ---------- */
+  function injectDev() {
+    const panel = document.getElementById('devPanel');
+    if (!panel || document.getElementById('devWatchHit')) return;
+    const sec = document.createElement('div');
+    sec.className = 'dev-sec';
+    sec.innerHTML = `
+      <div class="dev-title">分心守望</div>
+      <div class="dev-row"><button id="devWatchHit">模拟分心（罚）</button><button id="devWatchRing">响铃</button><button id="devWatchStop">停铃</button></div>
+      <div class="dev-row"><label>阈值(秒)</label><input type="number" id="devWatchSec" min="1" max="60"><button id="devWatchSet">设</button></div>`;
+    panel.insertBefore(sec, document.getElementById('devState'));
+    document.getElementById('devWatchSec').value = cfg().leaveSec;
+    document.getElementById('devWatchHit').addEventListener('click', () => punish(6, '模拟分心'));
+    document.getElementById('devWatchRing').addEventListener('click', startRing);
+    document.getElementById('devWatchStop').addEventListener('click', stopRing);
+    document.getElementById('devWatchSet').addEventListener('click', () => {
+      const c = cfg();
+      c.leaveSec = Math.max(1, Math.min(60, parseInt(document.getElementById('devWatchSec').value, 10) || 2));
+      save(); toast('离开阈值已设为 ' + c.leaveSec + ' 秒');
+    });
+  }
+
+  /* ---------- 调试接口 ---------- */
+  window.__JRG_WATCH__ = {
+    cfg: cfg,
+    auth: openAuth,
+    punish: (s, r) => punish(s || 5, r || '模拟分心'),
+    leave: onLeave,
+    back: onReturn,
+    ring: startRing,
+    stop: stopRing,
+    state: () => ({ enabled: cfg().enabled, asked: cfg().asked, hits: cfg().hits, leaveSec: cfg().leaveSec, shot: cfg().shot, away: awayAt ? Date.now() - awayAt : 0, phase: S.phase })
+  };
+
+  /* ---------- 初始化 ---------- */
+  function boot() {
+    injectSettings();
+    injectDev();
+    cfg();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+
 /* ================= 开发者面板 ================= */
 (function () {
   let devSpeed = 1;
